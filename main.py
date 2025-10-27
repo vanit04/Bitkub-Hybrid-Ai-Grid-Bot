@@ -247,7 +247,9 @@ async def get_market_data(symbol: str, timeframe: str = '60', limit: int = 500):
 async def get_latest_price(symbol: str):
     # Public API uses THB_SYMBOL format
     ticker_symbol = f"THB_{symbol.upper()}"
+    # --- MODIFICATION: Fixed missing 'https' protocol ---
     url = f"https://api.bitkub.com/api/market/ticker?sym={ticker_symbol}"
+    # --- END MODIFICATION ---
     async with httpx.AsyncClient() as client:
         try:
             response = await client.get(url, timeout=5)
@@ -287,6 +289,7 @@ class HybridGridBot:
         self.realized_pnl = 0.0 
         self.total_investment = 0.0 
         self.total_coins_held = 0.0
+        self.all_time_realized_pnl = 0.0 # <-- ADDED FOR PNL FIX
 
         self.mode_change_candidate = None
         self.mode_change_counter = 0
@@ -325,6 +328,7 @@ class HybridGridBot:
         self.realized_pnl = self.__dict__.get('realized_pnl', 0.0)
         self.total_investment = self.__dict__.get('total_investment', 0.0)
         self.total_coins_held = self.__dict__.get('total_coins_held', 0.0)
+        self.all_time_realized_pnl = self.__dict__.get('all_time_realized_pnl', 0.0) # <-- ADDED FOR PNL FIX
         
         # --- MODIFICATION: Handle loading smoothed sentiment state ---
         self.sentiment_score = state.get('sentiment_score', 0.0)
@@ -349,9 +353,10 @@ class HybridGridBot:
     async def start(self):
         self.is_running = True
         logger.info(f"[{self.settings['symbol']}] Bot instance STARTED.")
-        self.realized_pnl = 0.0
-        self.total_investment = 0.0
-        self.total_coins_held = 0.0
+        # Do not reset PNL on start, only on creation (handled by __init__)
+        # self.realized_pnl = 0.0 
+        # self.total_investment = 0.0
+        # self.total_coins_held = 0.0
         await self.send_telegram_message("✅ Bot started successfully!\nInitiating first logic cycle...")
     
     def stop(self): self.is_running = False; logger.info(f"[{self.settings['symbol']}] Bot instance STOPPED.")
@@ -642,7 +647,8 @@ class HybridGridBot:
                         proceeds = float(fill['amt'])
                         profit = proceeds - self.total_investment
                         self.realized_pnl += profit
-                        await self.send_telegram_message(f"✅ Assets sold. Realized P/L for this cycle: {profit:+.2f} THB")
+                        self.all_time_realized_pnl += profit # <-- PNL FIX
+                        await self.send_telegram_message(f"✅ ปิด Cycle. P/L ของรอบนี้: {profit:+.2f} THB (จะถูกนำไปทบต้น)") # <-- PNL FIX (text)
                     else:
                         await self.send_telegram_message(f"❌ Error selling: {res}")
                 else:
@@ -650,7 +656,8 @@ class HybridGridBot:
                     proceeds = self.total_coins_held * latest_price
                     profit = proceeds - self.total_investment
                     self.realized_pnl += profit
-                    await self.send_telegram_message(f"🧪 TEST MODE: Simulated selling. Realized P/L for this cycle: {profit:+.2f} THB")
+                    self.all_time_realized_pnl += profit # <-- PNL FIX
+                    await self.send_telegram_message(f"🧪 TEST MODE: ปิด Cycle. P/L ของรอบนี้: {profit:+.2f} THB (จะถูกนำไปทบต้น)") # <-- PNL FIX (text)
         self.total_investment, self.total_coins_held = 0.0, 0.0
 
     async def _enter_trailing_up_mode(self, client: BitkubClient):
@@ -890,6 +897,7 @@ class HybridGridBot:
             coin_amount = self.grid_capital_per_level / original_buy_price
             profit = (sell_price - original_buy_price) * coin_amount
             self.realized_pnl += profit
+            self.all_time_realized_pnl += profit # <-- PNL FIX
             self.total_investment -= self.grid_capital_per_level 
             self.total_coins_held -= coin_amount
             await self.send_telegram_message(f"   -> Realized Profit: <code>{profit:+.2f} THB</code>", use_html=True)
@@ -946,21 +954,31 @@ class HybridGridBot:
         self.open_sell_orders = {}
         self.open_buy_orders = {}
 
+    # --- PNL FIX: ENTIRE FUNCTION REPLACED ---
     def _calculate_pnl_components(self, latest_price, coin_balance):
+        # 1. คำนวณต้นทุนเฉลี่ยของเหรียญที่ถืออยู่
         average_cost = self.total_investment / self.total_coins_held if self.total_coins_held > 0 else 0
+        
+        # 2. คำนวณ P/L ที่ยังไม่เกิดขึ้นจริง (Unrealized)
         unrealized_pnl = (latest_price - average_cost) * coin_balance if average_cost > 0 else 0
         
-        current_equity = self.initial_capital + self.realized_pnl + unrealized_pnl
+        # 3. คำนวณมูลค่าพอร์ตปัจจุบัน (Equity)
+        # Equity = ทุนดั้งเดิม + กำไรที่เกิดขึ้นจริงทั้งหมด + กำไรที่ยังไม่เกิดขึ้น
+        current_equity = self.original_capital + self.all_time_realized_pnl + unrealized_pnl
         
+        # 4. คำนวณ P/L รวม
         total_pnl = current_equity - self.original_capital
         
+        # 5. คำนวณ % P/L รวม
         pnl_percent = (total_pnl / self.original_capital) * 100 if self.original_capital > 0 else 0
         
         return {
             "unrealized_pnl": unrealized_pnl, 
             "total_pnl": total_pnl, 
-            "pnl_percent": pnl_percent
+            "pnl_percent": pnl_percent,
+            "all_time_realized_pnl": self.all_time_realized_pnl # <-- ส่งค่าใหม่นี้ออกไปด้วย
         }
+    # --- END PNL FIX ---
 
     async def _generate_report_text(self, report_type: str) -> str:
         symbol = self.settings['symbol']; client = self.get_client()
@@ -1026,10 +1044,12 @@ class HybridGridBot:
         report_lines.append(f"Sentiment Justification: <i>{html.escape(self.sentiment_justification)}</i>")
 
         if report_type == 'data':
-            realized_pnl_color = "🟢" if self.realized_pnl >= 0 else "🔴"
+            # --- PNL FIX: MODIFIED THIS BLOCK ---
+            realized_pnl_color = "🟢" if pnl['all_time_realized_pnl'] >= 0 else "🔴"
             unrealized_pnl_color = "🟢" if pnl['unrealized_pnl'] >= 0 else "🔴"
-            report_lines.append(f"  - P/L (Cycle): {realized_pnl_color} <code>{self.realized_pnl:+,.2f} THB</code>")
+            report_lines.append(f"  - P/L (Realized): {realized_pnl_color} <code>{pnl['all_time_realized_pnl']:+,.2f} THB</code>")
             report_lines.append(f"  - Unrealized: {unrealized_pnl_color} <code>{pnl['unrealized_pnl']:+,.2f} THB</code>")
+            # --- END PNL FIX ---
             
             report_lines.append("\nGrid Orders (Live from Bitkub):")
             
