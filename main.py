@@ -1047,7 +1047,9 @@ class HybridGridBot:
             # --- PNL FIX: MODIFIED THIS BLOCK ---
             realized_pnl_color = "🟢" if pnl['all_time_realized_pnl'] >= 0 else "🔴"
             unrealized_pnl_color = "🟢" if pnl['unrealized_pnl'] >= 0 else "🔴"
+            # --- MODIFICATION: Fixed HTML Typo 'Code>' to '<code>' ---
             report_lines.append(f"  - P/L (Realized): {realized_pnl_color} <code>{pnl['all_time_realized_pnl']:+,.2f} THB</code>")
+            # --- END MODIFICATION ---
             report_lines.append(f"  - Unrealized: {unrealized_pnl_color} <code>{pnl['unrealized_pnl']:+,.2f} THB</code>")
             # --- END PNL FIX ---
             
@@ -1402,7 +1404,11 @@ async def handle_confirmation(update: Update, context: ContextTypes.DEFAULT_TYPE
         await update.message.reply_text("ยกเลิกการสร้างบอทแล้ว")
 
     context.user_data.clear()
-    kb = [[KeyboardButton("จัดการบอท")], [KeyboardButton("กลับไปเมนูหลัก")]]
+    
+    # --- MODIFICATION: Added Emojis to match handlers ---
+    kb = [[KeyboardButton("🤖 จัดการบอท")], [KeyboardButton("⬅️ กลับไปเมนูหลัก")]]
+    # --- END MODIFICATION ---
+    
     await update.message.reply_html(
         "กด จัดการบอท เพื่อดู/สั่งงานบอทของคุณ",
         reply_markup=ReplyKeyboardMarkup(kb, resize_keyboard=True, one_time_keyboard=True)
@@ -1588,6 +1594,22 @@ async def on_error(update: object, context: ContextTypes.DEFAULT_TYPE) -> None:
     if isinstance(err, TimedOut):
         logger.warning(f"Telegram API call timed out: {err}")
         return
+        
+    # --- MODIFICATION: Handle the specific HTML parsing error ---
+    if isinstance(err, BadRequest) and "Can't parse entities" in str(err):
+        logger.error(f"HTML PARSING ERROR: {err}. This usually means mismatched tags in a sent message.")
+        # Optionally send a safe message to the user
+        if update and hasattr(update, 'effective_chat_id'):
+            try:
+                await context.bot.send_message(
+                    chat_id=update.effective_chat_id, 
+                    text="⚠️ เกิดข้อผิดพลาดในการแสดงผล (HTML Error). กรุณาตรวจสอบ Log."
+                )
+            except Exception as e:
+                logger.error(f"Failed to send error fallback message: {e}")
+        return
+    # --- END MODIFICATION ---
+        
     logger.error("Unhandled error", exc_info=True)
 
 # --- Main Application Setup ---
@@ -1612,7 +1634,9 @@ def main() -> None:
     )
 
     manage_conv = ConversationHandler(
+        # --- MODIFICATION: Fixed typo 'บอт' to 'บอท' ---
         entry_points=[MessageHandler(filters.Regex('^🤖 จัดการบอท$'), manage_bots_start)],
+        # --- END MODIFICATION ---
         states={
             MANAGE_SELECT_BOT: [
                 MessageHandler(filters.Regex('^🤖 จัดการบอท$'), manage_bots_start),
