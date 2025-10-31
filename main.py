@@ -220,7 +220,6 @@ class BitkubClient:
     async def place_ask(self, sym, amt, rat, typ='limit'): return await self._make_request("POST", "/api/v3/market/place-ask", data={"sym": sym, "amt": amt, "rat": rat, "typ": typ})
     async def my_open_orders(self, sym): return await self._make_request("GET", "/api/v3/market/my-open-orders", params={"sym": sym})
     async def my_order_history(self, sym, p=1, l=10): return await self._make_request("GET", "/api/v3/market/my-order-history", params={"sym": sym, "p": p, "l": l})
-    # --- FIXED: Corrected API path from 'vv3' to 'v3' ---
     async def cancel_order(self, sym, order_id, side): return await self._make_request("POST", "/api/v3/market/cancel-order", data={"sym": sym, "id": order_id, "sd": side})
 
 async def get_market_data(symbol: str, timeframe: str = '60', limit: int = 500):
@@ -245,11 +244,8 @@ async def get_market_data(symbol: str, timeframe: str = '60', limit: int = 500):
     return pd.DataFrame()
 
 async def get_latest_price(symbol: str):
-    # Public API uses THB_SYMBOL format
     ticker_symbol = f"THB_{symbol.upper()}"
-    # --- MODIFICATION: Fixed missing 'https' protocol ---
     url = f"https://api.bitkub.com/api/market/ticker?sym={ticker_symbol}"
-    # --- END MODIFICATION ---
     async with httpx.AsyncClient() as client:
         try:
             response = await client.get(url, timeout=5)
@@ -261,7 +257,6 @@ async def get_latest_price(symbol: str):
             return None
 
 def format_display_price(price: float) -> str:
-    """Formats a price for display, removing unnecessary trailing zeros."""
     if price is None:
         return "N/A"
     return f"{price:,.8f}".rstrip('0').rstrip('.')
@@ -283,13 +278,15 @@ class HybridGridBot:
         self.open_sell_orders = {}
         self.last_checked_price = 0
         
+        # --- PNL REFACTOR ---
         self.initial_capital = self.settings.get('capital', 0) 
         self.original_capital = self.settings.get('capital', 0)
+        # --- END PNL REFACTOR ---
         
-        self.realized_pnl = 0.0 
+        self.realized_pnl = 0.0 # PNL for *this cycle*
         self.total_investment = 0.0 
         self.total_coins_held = 0.0
-        self.all_time_realized_pnl = 0.0 # <-- ADDED FOR PNL FIX
+        self.all_time_realized_pnl = 0.0 # PNL *total* (Used for compounding)
 
         self.mode_change_candidate = None
         self.mode_change_counter = 0
@@ -297,13 +294,11 @@ class HybridGridBot:
         
         self.is_shifting_grid = False
         
-        # --- MODIFICATION: Added variables for smoothing sentiment ---
-        self.sentiment_score = 0.0       # Stores the *latest* score for display
-        self.avg_sentiment_score = 0.0   # Stores the *smoothed average* for logic
-        self.sentiment_score_history = [] # Stores last 3 scores (45 mins)
+        self.sentiment_score = 0.0
+        self.avg_sentiment_score = 0.0
+        self.sentiment_score_history = []
         self.sentiment_justification = "N/A"
-        self.SMOOTHING_PERIOD = 3        # Number of sentiment scores to average
-        # --- END MODIFICATION ---
+        self.SMOOTHING_PERIOD = 3
 
         self.gemini_api_key = self.client_settings.get('gemini_api_key', "") 
         self.gemini_http_client = httpx.AsyncClient(timeout=30.0)
@@ -328,21 +323,18 @@ class HybridGridBot:
         self.realized_pnl = self.__dict__.get('realized_pnl', 0.0)
         self.total_investment = self.__dict__.get('total_investment', 0.0)
         self.total_coins_held = self.__dict__.get('total_coins_held', 0.0)
-        self.all_time_realized_pnl = self.__dict__.get('all_time_realized_pnl', 0.0) # <-- ADDED FOR PNL FIX
+        self.all_time_realized_pnl = self.__dict__.get('all_time_realized_pnl', 0.0)
         
-        # --- MODIFICATION: Handle loading smoothed sentiment state ---
         self.sentiment_score = state.get('sentiment_score', 0.0)
         self.sentiment_score_history = state.get('sentiment_score_history', [])
         self.SMOOTHING_PERIOD = state.get('SMOOTHING_PERIOD', 3)
         
-        # Recalculate average sentiment on load
         if self.sentiment_score_history:
             self.avg_sentiment_score = sum(self.sentiment_score_history) / len(self.sentiment_score_history)
         else:
-            self.avg_sentiment_score = self.sentiment_score # Fallback to latest score if no history
+            self.avg_sentiment_score = self.sentiment_score
             
         self.sentiment_justification = state.get('sentiment_justification', "N/A")
-        # --- END MODIFICATION ---
         
         self.context = None
         self.gemini_http_client = httpx.AsyncClient(timeout=30.0)
@@ -353,10 +345,6 @@ class HybridGridBot:
     async def start(self):
         self.is_running = True
         logger.info(f"[{self.settings['symbol']}] Bot instance STARTED.")
-        # Do not reset PNL on start, only on creation (handled by __init__)
-        # self.realized_pnl = 0.0 
-        # self.total_investment = 0.0
-        # self.total_coins_held = 0.0
         await self.send_telegram_message("✅ Bot started successfully!\nInitiating first logic cycle...")
     
     def stop(self): self.is_running = False; logger.info(f"[{self.settings['symbol']}] Bot instance STOPPED.")
@@ -408,15 +396,12 @@ class HybridGridBot:
             
         logger.info(f"[{symbol}] Running strategic sentiment analysis...")
         
-        # --- FIXED: Corrected API URL and authentication ---
         api_url = "https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash:generateContent"
         
-        # Fixed headers - using proper authentication
         headers = {
             "Content-Type": "application/json",
             "x-goog-api-key": self.gemini_api_key
         }
-        # --- END FIX ---
         
         summarized_news = ""
 
@@ -478,36 +463,20 @@ class HybridGridBot:
             text_content = result_analyze.get('candidates', [{}])[0].get('content', {}).get('parts', [{}])[0].get('text', '{}')
             parsed_json = json.loads(text_content)
 
-            # --- MODIFICATION: Apply smoothing logic ---
             latest_score = float(parsed_json.get('sentiment_score', 0.0))
             self.sentiment_justification = parsed_json.get('justification', 'No justification provided.')
-            self.sentiment_score = latest_score # Store latest score for display
+            self.sentiment_score = latest_score
 
-            # Update history
             self.sentiment_score_history.append(latest_score)
-            # Keep only the last N scores
             if len(self.sentiment_score_history) > self.SMOOTHING_PERIOD:
                 self.sentiment_score_history.pop(0) 
             
-            # Calculate and store the new average
             self.avg_sentiment_score = sum(self.sentiment_score_history) / len(self.sentiment_score_history)
             
             logger.info(f"[{symbol}] Sentiment updated. Latest: {self.sentiment_score:+.1f}, Smoothed Avg (n={len(self.sentiment_score_history)}): {self.avg_sentiment_score:+.2f}")
             
-            # Send updated message to user showing both scores
-            # --- MODIFICATION: ปิดการแจ้งเตือน Sentiment ทุก 15 นาทีตามคำขอ ---
-            # await self.send_telegram_message(
-            #     f"🧠 [{symbol}] AI Sentiment Updated:\n"
-            #     f"Latest Score: <code>{self.sentiment_score:+.1f}</code>\n"
-            #     f"Smoothed Avg: <code>{self.avg_sentiment_score:+.2f}</code> (<b>Used for Logic</b>)\n"
-            #     f"Reason: <i>{html.escape(self.sentiment_justification)}</i>", 
-            #     use_html=True
-            # )
-            # --- END MODIFICATION ---
-            
         except Exception as e:
             logger.error(f"[{symbol}] Failed during sentiment analysis (Step 2 - Analyze): {e}", exc_info=True)
-            # Don't reset avg_sentiment_score, let it use the old average
             self.sentiment_justification = "Failed to analyze sentiment."
             await self.send_telegram_message(f"⚠️ [{symbol}] ไม่สามารถวิเคราะห์ข้อมูล Sentiment (AI Layer 2) ได้ในรอบนี้")
 
@@ -516,15 +485,13 @@ class HybridGridBot:
         score = 0
         weights = {'ema': 1.5, 'macd': 1.5, 'rsi': 1.0, 'bbands': 1.0, 'obv': 0.5}
 
-        # 1. EMA (20/50) Crossover Score
         df['ema_20'] = ta.trend.ema_indicator(df['close'], window=20)
         df['ema_50'] = ta.trend.ema_indicator(df['close'], window=50)
         if df['ema_20'].iloc[-2] < df['ema_50'].iloc[-2] and df['ema_20'].iloc[-1] > df['ema_50'].iloc[-1]:
-            score += weights['ema']  # Golden Cross
+            score += weights['ema']
         if df['ema_20'].iloc[-2] > df['ema_50'].iloc[-2] and df['ema_20'].iloc[-1] < df['ema_50'].iloc[-1]:
-            score -= weights['ema']  # Dead Cross
+            score -= weights['ema']
 
-        # 2. MACD Score
         macd = ta.trend.MACD(df['close'])
         df['macd'] = macd.macd()
         df['macdsignal'] = macd.macd_signal()
@@ -533,36 +500,30 @@ class HybridGridBot:
         if df['macd'].iloc[-2] > df['macdsignal'].iloc[-2] and df['macd'].iloc[-1] < df['macdsignal'].iloc[-1]:
             score -= weights['macd']
 
-        # 3. RSI Score
         df['rsi'] = ta.momentum.RSIIndicator(df['close']).rsi()
-        if df['rsi'].iloc[-1] < 30: score += weights['rsi'] # Oversold
-        if df['rsi'].iloc[-1] > 70: score -= weights['rsi'] # Overbought
+        if df['rsi'].iloc[-1] < 30: score += weights['rsi']
+        if df['rsi'].iloc[-1] > 70: score -= weights['rsi']
         
-        # 4. Bollinger Bands Score
         bb = ta.volatility.BollingerBands(df['close'])
         df['bb_high'] = bb.bollinger_hband()
         df['bb_low'] = bb.bollinger_lband()
         if df['close'].iloc[-1] < df['bb_low'].iloc[-1]:
-            score += weights['bbands'] # Price below lower band (potential reversal up)
+            score += weights['bbands']
         if df['close'].iloc[-1] > df['bb_high'].iloc[-1]:
-            score -= weights['bbands'] # Price above upper band (potential reversal down)
+            score -= weights['bbands']
 
-        # 5. OBV Score
         df['obv'] = ta.volume.OnBalanceVolumeIndicator(df['close'], df['volume']).on_balance_volume()
         if df['obv'].iloc[-1] > df['obv'].iloc[-2] and df['close'].iloc[-1] > df['close'].iloc[-2]:
-             score += weights['obv'] # Volume confirms uptrend
+             score += weights['obv']
         if df['obv'].iloc[-1] < df['obv'].iloc[-2] and df['close'].iloc[-1] < df['close'].iloc[-2]:
-             score -= weights['obv'] # Volume confirms downtrend
+             score -= weights['obv']
 
-        # 6. ADX Value
         adx_indicator = ta.trend.ADXIndicator(df['high'], df['low'], df['close'])
         adx_value = adx_indicator.adx().iloc[-1]
         
         return score, adx_value
 
-    # --- MODIFICATION: Refactored interpretation functions ---
     def get_ta_interpretation(self):
-        """Returns icon and text for the current TA score."""
         score = self.ai_score
         if score >= 2.5: return "📈", "Bullish แรง"
         elif score >= 1.0: return "↗️", "Bullish อ่อน"
@@ -571,50 +532,34 @@ class HybridGridBot:
         else: return "📉", "Bearish แรง"
 
     def get_sentiment_interpretation(self, score_value: float):
-        """Returns icon and text for a given sentiment score value."""
         if score_value >= 0.5: return "🤩", "ดีมาก"
         elif score_value >= 0.1: return "🙂", "ค่อนข้างดี"
         elif score_value > -0.1: return "😐", "เป็นกลาง"
         elif score_value > -0.5: return "😟", "ค่อนข้างแย่"
         else: return "😨", "แย่มาก (FUD)"
-    # --- END MODIFICATION ---
 
 
     async def _determine_strategy(self):
-        # --- STRATEGY UPDATE: Reworked logic to prioritize Sentiment Veto ---
-
-        # --- MODIFICATION: Use avg_sentiment_score for Veto logic ---
-        # 1. Highest Priority: Sentiment Veto (Now uses the smoothed average)
         if self.avg_sentiment_score < -0.5:
             if self.current_mode != "SAFE":
                 await self.send_telegram_message(f"‼️ [{self.settings['symbol']}] Smoothed Sentiment Veto! Average score ({self.avg_sentiment_score:+.2f}) is critical. Forcing SAFE mode.")
             return "SAFE"
-        # --- END MODIFICATION ---
 
-        # 2. Logic for when the bot is ALREADY in a trend mode (Asymmetric Exit)
         if self.current_mode == "TRAILING_UP":
-            if self.adx > 30 and self.ai_score <= -2.5: return "SAFE" # Strong reversal
-            if self.ai_score < 1.0: return "GRID" # Trend weakened
-            return "TRAILING_UP" # Stay in trend
+            if self.adx > 30 and self.ai_score <= -2.5: return "SAFE"
+            if self.ai_score < 1.0: return "GRID"
+            return "TRAILING_UP"
 
         if self.current_mode == "SAFE":
-            # Bot can only exit SAFE if sentiment is no longer critically negative
-            # --- MODIFICATION: Use avg_sentiment_score for exit logic ---
-            # We check the TA score AND that the average sentiment is not bad
             if self.ai_score > -1.0 and self.avg_sentiment_score >= -0.5: 
-                return "GRID" # Downtrend weakened, sentiment is OK
-            return "SAFE" # Stay safe
-            # --- END MODIFICATION ---
+                return "GRID"
+            return "SAFE"
 
-        # 3. Default entry logic for when in GRID mode (Stricter Entry)
         if self.adx > 30 and self.ai_score >= 2.5:
-            # --- MODIFICATION: Use avg_sentiment_score for Veto logic ---
-            # Veto logic before entering a new buy-heavy mode
-            if self.avg_sentiment_score < -0.2: # Be cautious even with neutral-negative news
+            if self.avg_sentiment_score < -0.2:
                 await self.send_telegram_message(f"⚠️ [{self.settings['symbol']}] TA signal is Bullish, but Smoothed Sentiment is not positive ({self.avg_sentiment_score:+.2f}). Blocking switch to TRAILING_UP.")
-                return "GRID" # Block entry
+                return "GRID"
             return "TRAILING_UP"
-            # --- END MODIFICATION ---
             
         if self.adx > 30 and self.ai_score <= -2.5: return "SAFE"
         
@@ -647,8 +592,8 @@ class HybridGridBot:
                         proceeds = float(fill['amt'])
                         profit = proceeds - self.total_investment
                         self.realized_pnl += profit
-                        self.all_time_realized_pnl += profit # <-- PNL FIX
-                        await self.send_telegram_message(f"✅ ปิด Cycle. P/L ของรอบนี้: {profit:+.2f} THB (จะถูกนำไปทบต้น)") # <-- PNL FIX (text)
+                        self.all_time_realized_pnl += profit
+                        await self.send_telegram_message(f"✅ ปิด Cycle. P/L ของรอบนี้: {profit:+.2f} THB (จะถูกนำไปทบต้น)")
                     else:
                         await self.send_telegram_message(f"❌ Error selling: {res}")
                 else:
@@ -656,23 +601,27 @@ class HybridGridBot:
                     proceeds = self.total_coins_held * latest_price
                     profit = proceeds - self.total_investment
                     self.realized_pnl += profit
-                    self.all_time_realized_pnl += profit # <-- PNL FIX
-                    await self.send_telegram_message(f"🧪 TEST MODE: ปิด Cycle. P/L ของรอบนี้: {profit:+.2f} THB (จะถูกนำไปทบต้น)") # <-- PNL FIX (text)
+                    self.all_time_realized_pnl += profit
+                    await self.send_telegram_message(f"🧪 TEST MODE: ปิด Cycle. P/L ของรอบนี้: {profit:+.2f} THB (จะถูกนำไปทบต้น)")
         self.total_investment, self.total_coins_held = 0.0, 0.0
 
     async def _enter_trailing_up_mode(self, client: BitkubClient):
         await self.send_telegram_message("⏳ Entering TRAILING_UP mode. Re-investing compounded capital...")
 
-        new_capital_base = self.initial_capital + self.realized_pnl
-        capital_to_use = 0
-        if new_capital_base > 100:
-            if abs(new_capital_base - self.initial_capital) > 1:
-                await self.send_telegram_message(f"📈 Compounding portfolio. New capital base is now {new_capital_base:,.2f} THB.")
-            self.initial_capital = new_capital_base
-            self.realized_pnl = 0.0
-            capital_to_use = self.initial_capital * 0.995
-        else:
-            capital_to_use = self.settings['capital'] * 0.995
+        # --- PNL REFACTOR ---
+        total_equity = self.original_capital + self.all_time_realized_pnl
+        
+        if total_equity < 100:
+            await self.send_telegram_message(f"❌ Not enough capital to enter TRAILING_UP. Total equity is only {total_equity:,.2f} THB.")
+            self.stop()
+            return
+
+        if self.realized_pnl != 0:
+             await self.send_telegram_message(f"ℹ️ Compounding P/L. Total equity for this cycle is now {total_equity:,.2f} THB.")
+        
+        self.realized_pnl = 0.0
+        capital_to_use = total_equity * 0.995
+        # --- END PNL REFACTOR ---
 
         balances = await client.get_balances()
         if balances.get('error') == 0:
@@ -691,6 +640,16 @@ class HybridGridBot:
                     await self.send_telegram_message(f"✅ Re-invested {capital_to_use:,.2f} THB for Trailing Up.")
                 else:
                     await self.send_telegram_message(f"❌ Error buying for Trailing Up: {res}")
+            
+            elif capital_to_use > 10 and self.settings.get('trade_mode') == 'Test':
+                latest_price = await get_latest_price(self.settings['symbol']) or self.last_checked_price
+                if latest_price > 0:
+                    self.total_investment = capital_to_use
+                    self.total_coins_held = capital_to_use / latest_price
+                    await self.send_telegram_message(f"🧪 TEST MODE: Re-invested {capital_to_use:,.2f} THB for Trailing Up.")
+                else:
+                    await self.send_telegram_message(f"❌ TEST MODE: Could not get price to simulate buy.")
+            
         else:
             await self.send_telegram_message(f"❌ Could not check balance to enter Trailing Up mode: {balances}")
 
@@ -707,14 +666,20 @@ class HybridGridBot:
         if not latest_price:
             await self.send_telegram_message("❌ Grid setup failed: could not get latest price."); return await self._enter_safe_mode(client)
         
-        new_capital_base = self.initial_capital + self.realized_pnl
-        if new_capital_base > 100:
-            if abs(new_capital_base - self.initial_capital) > 1:
-                await self.send_telegram_message(f"📈 Compounding portfolio. New capital base is now {new_capital_base:,.2f} THB.")
-            self.initial_capital = new_capital_base
-            self.realized_pnl = 0.0
+        # --- PNL REFACTOR ---
+        total_equity = self.original_capital + self.all_time_realized_pnl
 
-        self.grid_capital_per_level = self.initial_capital / len(self.grid_levels) if self.grid_levels else 0
+        if total_equity < 100:
+            await self.send_telegram_message(f"❌ Not enough capital to enter GRID. Total equity is only {total_equity:,.2f} THB.")
+            self.stop()
+            return
+        
+        if self.realized_pnl != 0:
+             await self.send_telegram_message(f"ℹ️ Compounding P/L. Total equity for this cycle is now {total_equity:,.2f} THB.")
+
+        self.realized_pnl = 0.0
+        self.grid_capital_per_level = total_equity / len(self.grid_levels) if self.grid_levels else 0
+        # --- END PNL REFACTOR ---
         
         if self.grid_capital_per_level < 10:
              await self.send_telegram_message(f"❌ Capital per grid ({self.grid_capital_per_level:.2f} THB) is below the 10 THB minimum. Please restart with more capital or a different grid strategy.")
@@ -726,28 +691,39 @@ class HybridGridBot:
         
         capital_for_initial_sells = self.grid_capital_per_level * len(sell_levels_prices)
         
-        balances = await client.get_balances()
-        if balances.get('error') != 0:
-            await self.send_telegram_message(f"❌ Could not check balance to enter Grid mode: {balances}"); return await self._enter_safe_mode(client)
-        
-        available_thb = float(balances.get('result', {}).get('THB', {}).get('available', 0))
-        capital_to_buy = min(capital_for_initial_sells, available_thb * 0.995)
+        coin_available = 0.0
 
-        if capital_to_buy > 10 and self.settings.get('trade_mode') == 'Live':
-            await self.send_telegram_message(f"Buying initial coins with {capital_to_buy:,.2f} THB...")
-            res = await client.place_bid(api_symbol, amt=capital_to_buy, rat=0, typ='market')
+        if self.settings.get('trade_mode') == 'Live':
+            balances = await client.get_balances()
+            if balances.get('error') != 0:
+                await self.send_telegram_message(f"❌ Could not check balance to enter Grid mode: {balances}"); return await self._enter_safe_mode(client)
             
-            if res.get('error') == 0:
-                fill = res['result']
-                self.total_investment += float(fill['amt'])
-                self.total_coins_held += float(fill['cre'])
-                await self.send_telegram_message("✅ Initial coins purchased.")
-                await asyncio.sleep(2)
-            else:
-                await self.send_telegram_message(f"❌ Failed to buy initial coins: {res}"); return await self._enter_safe_mode(client)
+            available_thb = float(balances.get('result', {}).get('THB', {}).get('available', 0))
+            capital_to_buy = min(capital_for_initial_sells, available_thb * 0.995)
+
+            if capital_to_buy > 10:
+                await self.send_telegram_message(f"Buying initial coins with {capital_to_buy:,.2f} THB...")
+                res = await client.place_bid(api_symbol, amt=capital_to_buy, rat=0, typ='market')
+                
+                if res.get('error') == 0:
+                    fill = res['result']
+                    self.total_investment += float(fill['amt'])
+                    self.total_coins_held += float(fill['cre'])
+                    await self.send_telegram_message("✅ Initial coins purchased.")
+                    await asyncio.sleep(2)
+                else:
+                    await self.send_telegram_message(f"❌ Failed to buy initial coins: {res}"); return await self._enter_safe_mode(client)
+            
+            balances = await client.get_balances() # Re-check balances
+            coin_available = float(balances.get('result', {}).get(symbol, {}).get('available', 0))
         
-        balances = await client.get_balances()
-        coin_available = float(balances.get('result', {}).get(symbol, {}).get('available', 0))
+        else: # Test Mode
+            capital_to_buy = capital_for_initial_sells
+            if capital_to_buy > 10:
+                self.total_investment += capital_to_buy
+                self.total_coins_held += capital_to_buy / latest_price
+                await self.send_telegram_message(f"🧪 TEST MODE: Simulating initial buy with {capital_to_buy:,.2f} THB.")
+            coin_available = self.total_coins_held
         
         coin_per_sell_grid = coin_available / len(sell_levels_prices) if sell_levels_prices else 0
         
@@ -816,12 +792,20 @@ class HybridGridBot:
 
         await self._cancel_all_orders(client)
 
-        new_capital_base = self.initial_capital + self.realized_pnl
-        if new_capital_base > 100:
-            if abs(new_capital_base - self.initial_capital) > 1:
-                await self.send_telegram_message(f"📈 Compounding! New capital base is now {new_capital_base:,.2f} THB.")
-            self.initial_capital = new_capital_base
-            self.realized_pnl = 0.0
+        # --- PNL REFACTOR ---
+        total_equity = self.original_capital + self.all_time_realized_pnl
+        
+        if total_equity < 100:
+            await self.send_telegram_message(f"❌ Not enough capital to shift grid. Total equity is only {total_equity:,.2f} THB.")
+            self.stop()
+            self.is_shifting_grid = False
+            return
+
+        if self.realized_pnl != 0:
+            await self.send_telegram_message(f"📈 Compounding! Total equity for new grid is now {total_equity:,.2f} THB.")
+        
+        self.realized_pnl = 0.0
+        # --- END PNL REFACTOR ---
 
         await self._calculate_grid_levels(df)
         if not self.grid_levels:
@@ -829,7 +813,7 @@ class HybridGridBot:
             self.is_shifting_grid = False
             return await self._handle_mode_transition("SAFE", df)
 
-        self.grid_capital_per_level = self.initial_capital / len(self.grid_levels) if self.grid_levels else 0
+        self.grid_capital_per_level = total_equity / len(self.grid_levels) if self.grid_levels else 0
 
         if self.grid_capital_per_level < 10:
              await self.send_telegram_message(f"❌ Capital per grid ({self.grid_capital_per_level:.2f} THB) is too low after compounding. Stopping bot.")
@@ -854,7 +838,6 @@ class HybridGridBot:
         self.is_shifting_grid = False
 
     async def _manage_grid(self, df):
-        """Manages the grid using an order flipping strategy with Limit Orders."""
         if self.is_shifting_grid: return
 
         symbol = self.settings['symbol']; client = self.get_client()
@@ -873,18 +856,30 @@ class HybridGridBot:
                 await self.send_telegram_message(f"🚨 [{symbol}] ATR STOP-LOSS TRIGGERED at {format_display_price(sl_price)}!"); 
                 return await self._handle_mode_transition("SAFE", df)
 
-
-        open_orders_res = await client.my_open_orders(api_symbol)
-        if open_orders_res.get('error') != 0:
-            logger.warning(f"Could not fetch open orders for {symbol}. Skipping management cycle.")
-            return
-
-        current_open_ids = {o['id'] for o in open_orders_res.get('result', [])}
+        filled_buys = {}
+        filled_sells = {}
         processed_prices_this_cycle = set()
-
-        filled_sells = {p: oid for p, oid in self.open_sell_orders.items() if oid not in current_open_ids}
-        for sell_price, order_id in filled_sells.items():
+        
+        if self.settings.get('trade_mode') == 'Live':
+            open_orders_res = await client.my_open_orders(api_symbol)
+            if open_orders_res.get('error') != 0:
+                logger.warning(f"Could not fetch open orders for {symbol}. Skipping management cycle.")
+                return
+            current_open_ids = {o['id'] for o in open_orders_res.get('result', [])}
             
+            filled_sells = {p: oid for p, oid in self.open_sell_orders.items() if oid not in current_open_ids}
+            filled_buys = {p: oid for p, oid in self.open_buy_orders.items() if oid not in current_open_ids}
+        
+        else: # Test Mode Simulation
+            for sell_price in list(self.open_sell_orders.keys()):
+                if current_price >= sell_price:
+                    filled_sells[sell_price] = self.open_sell_orders[sell_price]
+            
+            for buy_price in list(self.open_buy_orders.keys()):
+                if current_price <= buy_price:
+                    filled_buys[buy_price] = self.open_buy_orders[buy_price]
+
+        for sell_price, order_id in filled_sells.items():
             profit_pct = self.settings.get('profit_percent', 0)
             original_buy_price = self._format_price(sell_price / (1 + profit_pct / 100))
 
@@ -896,8 +891,7 @@ class HybridGridBot:
             
             coin_amount = self.grid_capital_per_level / original_buy_price
             profit = (sell_price - original_buy_price) * coin_amount
-            self.realized_pnl += profit
-            self.all_time_realized_pnl += profit # <-- PNL FIX
+            self.all_time_realized_pnl += profit
             self.total_investment -= self.grid_capital_per_level 
             self.total_coins_held -= coin_amount
             await self.send_telegram_message(f"   -> Realized Profit: <code>{profit:+.2f} THB</code>", use_html=True)
@@ -913,9 +907,7 @@ class HybridGridBot:
                 await self.send_telegram_message(f"   -> 🆕 [Test] New BUY order placed at <code>{format_display_price(original_buy_price)}</code>", use_html=True)
 
 
-        filled_buys = {p: oid for p, oid in self.open_buy_orders.items() if oid not in current_open_ids}
         for buy_price, order_id in filled_buys.items():
-            
             profit_pct = self.settings.get('profit_percent', 0)
             sell_price = self._format_price(buy_price * (1 + profit_pct / 100))
 
@@ -954,31 +946,24 @@ class HybridGridBot:
         self.open_sell_orders = {}
         self.open_buy_orders = {}
 
-    # --- PNL FIX: ENTIRE FUNCTION REPLACED ---
     def _calculate_pnl_components(self, latest_price, coin_balance):
-        # 1. คำนวณต้นทุนเฉลี่ยของเหรียญที่ถืออยู่
         average_cost = self.total_investment / self.total_coins_held if self.total_coins_held > 0 else 0
         
-        # 2. คำนวณ P/L ที่ยังไม่เกิดขึ้นจริง (Unrealized)
-        unrealized_pnl = (latest_price - average_cost) * coin_balance if average_cost > 0 else 0
+        # --- MODIFICATION: Use bot's internal 'total_coins_held' not exchange 'coin_balance' ---
+        unrealized_pnl = (latest_price - average_cost) * self.total_coins_held if average_cost > 0 else 0
+        # --- END MODIFICATION ---
         
-        # 3. คำนวณมูลค่าพอร์ตปัจจุบัน (Equity)
-        # Equity = ทุนดั้งเดิม + กำไรที่เกิดขึ้นจริงทั้งหมด + กำไรที่ยังไม่เกิดขึ้น
         current_equity = self.original_capital + self.all_time_realized_pnl + unrealized_pnl
         
-        # 4. คำนวณ P/L รวม
         total_pnl = current_equity - self.original_capital
-        
-        # 5. คำนวณ % P/L รวม
         pnl_percent = (total_pnl / self.original_capital) * 100 if self.original_capital > 0 else 0
         
         return {
             "unrealized_pnl": unrealized_pnl, 
             "total_pnl": total_pnl, 
             "pnl_percent": pnl_percent,
-            "all_time_realized_pnl": self.all_time_realized_pnl # <-- ส่งค่าใหม่นี้ออกไปด้วย
+            "all_time_realized_pnl": self.all_time_realized_pnl
         }
-    # --- END PNL FIX ---
 
     async def _generate_report_text(self, report_type: str) -> str:
         symbol = self.settings['symbol']; client = self.get_client()
@@ -986,45 +971,46 @@ class HybridGridBot:
         status_text = '🟢 Active' if self.is_running else '🔴 Inactive'
         latest_price = await get_latest_price(symbol) or self.last_checked_price
         
-        # --- MODIFICATION ---
-        # If bot is running and sentiment hasn't been run yet (is "N/A"),
-        # trigger an update now so the report shows fresh data.
         if self.is_running and (self.sentiment_justification == "N/A" or not self.sentiment_justification):
             logger.info(f"[{symbol}] Triggering on-demand sentiment analysis for report.")
             await self.send_telegram_message(f"⏳ [{symbol}] กำลังอัปเดต Sentiment (ครั้งแรก)...")
             await self.update_sentiment_analysis() 
-            # This will update self.sentiment_justification and self.avg_sentiment_score
-        # --- END MODIFICATION ---
 
         if self.ai_score == 0 and self.is_running:
             df = await get_market_data(symbol, self.settings['timeframe'])
             if not df.empty: self.ai_score, self.adx = self._calculate_ai_score(df)
 
-        # --- MODIFICATION: Use new interpretation functions ---
         ai_icon, ai_text = self.get_ta_interpretation()
-        # Show interpretation of the LATEST score
         senti_icon, senti_text = self.get_sentiment_interpretation(self.sentiment_score)
-        # Show interpretation of the AVERAGE score
         avg_senti_icon, avg_senti_text = self.get_sentiment_interpretation(self.avg_sentiment_score)
-        # --- END MODIFICATION ---
 
         mode_icon = {'SAFE': '🛡️', 'GRID': '↔️', 'TRAILING_UP': '📈'}.get(self.current_mode, '❓')
-        balances = await client.get_balances()
-        coin_balance = float(balances.get('result',{}).get(symbol,{}).get('available',0)) if balances.get('error') == 0 else self.total_coins_held
         
-        pnl = self._calculate_pnl_components(latest_price, coin_balance)
-        
-        open_orders_res = await client.my_open_orders(api_symbol)
+        coin_balance = 0
         live_open_buys = []
         live_open_sells = []
-        if open_orders_res.get('error') == 0:
-            for order in open_orders_res.get('result', []):
-                if order['side'].lower() == 'buy':
-                    live_open_buys.append(float(order['rate']))
-                elif order['side'].lower() == 'sell':
-                    live_open_sells.append(float(order['rate']))
 
-        # --- MODIFICATION: Update report lines to show both scores ---
+        if self.settings.get('trade_mode') == 'Live':
+            balances = await client.get_balances()
+            coin_balance = float(balances.get('result',{}).get(symbol,{}).get('available',0)) if balances.get('error') == 0 else self.total_coins_held
+            
+            open_orders_res = await client.my_open_orders(api_symbol)
+            if open_orders_res.get('error') == 0:
+                for order in open_orders_res.get('result', []):
+                    if order['side'].lower() == 'buy':
+                        live_open_buys.append(float(order['rate']))
+                    elif order['side'].lower() == 'sell':
+                        live_open_sells.append(float(order['rate']))
+        else: # Test Mode
+            coin_balance = self.total_coins_held
+            live_open_buys = list(self.open_buy_orders.keys())
+            live_open_sells = list(self.open_sell_orders.keys())
+
+        # --- MODIFICATION: Pass 'coin_balance' (from exchange) for display ---
+        # --- The actual calculation bug is fixed inside _calculate_pnl_components ---
+        pnl = self._calculate_pnl_components(latest_price, coin_balance)
+        # --- END MODIFICATION ---
+
         report_lines = [
             f"Status: {status_text}",
             f"Last Price: 🪙 <code>{format_display_price(latest_price)} THB</code>",
@@ -1033,27 +1019,21 @@ class HybridGridBot:
             f"AI (Sentiment): {senti_icon} {html.escape(senti_text)} (Latest: <code>{self.sentiment_score:+.1f}</code>)",
             f"AI (Sentiment Avg): {avg_senti_icon} {html.escape(avg_senti_text)} (Avg: <code>{self.avg_sentiment_score:+.2f}</code> <b>[Logic]</b>)",
             f"Grid Orders: 🟢 BUY <code>{len(live_open_buys)}</code> | 🔴 SELL <code>{len(live_open_sells)}</code>",
-            f"Capital Base: 💰 <code>{self.initial_capital:,.2f} THB</code> (Original: {self.original_capital:,.2f})",
+            f"Original Capital: 💰 <code>{self.original_capital:,.2f} THB</code>",
         ]
-        # --- END MODIFICATION ---
         
         total_pnl_color = "🟢" if pnl['total_pnl'] >= 0 else "🔴"
         report_lines.append(f"P/L (Total): {total_pnl_color} <code>{pnl['total_pnl']:+,.2f} THB ({pnl['pnl_percent']:+.2f}%)</code>")
 
-        # This line is already correctly placed outside the if-block from the previous fix
         report_lines.append(f"Sentiment Justification: <i>{html.escape(self.sentiment_justification)}</i>")
 
         if report_type == 'data':
-            # --- PNL FIX: MODIFIED THIS BLOCK ---
             realized_pnl_color = "🟢" if pnl['all_time_realized_pnl'] >= 0 else "🔴"
             unrealized_pnl_color = "🟢" if pnl['unrealized_pnl'] >= 0 else "🔴"
-            # --- MODIFICATION: Fixed HTML Typo 'Code>' to '<code>' ---
             report_lines.append(f"  - P/L (Realized): {realized_pnl_color} <code>{pnl['all_time_realized_pnl']:+,.2f} THB</code>")
-            # --- END MODIFICATION ---
             report_lines.append(f"  - Unrealized: {unrealized_pnl_color} <code>{pnl['unrealized_pnl']:+,.2f} THB</code>")
-            # --- END PNL FIX ---
             
-            report_lines.append("\nGrid Orders (Live from Bitkub):")
+            report_lines.append(f"\nGrid Orders ({'Live' if self.settings.get('trade_mode') == 'Live' else 'Test Mode'}):")
             
             for price in sorted(live_open_sells, reverse=True): 
                 report_lines.append(f"🔴 Sell at <code>{format_display_price(price)}</code>")
@@ -1123,15 +1103,11 @@ async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
     reply_markup = ReplyKeyboardMarkup(keyboard, resize_keyboard=True)
     
     try:
-        # อ่านเนื้อหาจากไฟล์ help_guide.md
         with open('help_guide.md', 'r', encoding='utf-8') as f:
             help_text = f.read()
-        
-        # ส่งเป็น text ธรรมดา (reply_text) ซึ่งจะรักษารูปแบบการขึ้นบรรทัดใหม่จากไฟล์ .md
         await update.message.reply_text(help_text, reply_markup=reply_markup)
         
     except FileNotFoundError:
-        # กรณีหาไฟล์ help_guide.md ไม่เจอ
         logger.error("help_guide.md not found. Sending fallback help message.")
         fallback_text = (
             "<b><u>คำสั่งหลัก</u></b>\n"
@@ -1142,7 +1118,6 @@ async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
         )
         await update.message.reply_html(fallback_text, reply_markup=reply_markup)
     except Exception as e:
-        # กรณีเกิดข้อผิดพลาดอื่นๆ
         logger.error(f"Error reading help_guide.md: {e}")
         await update.message.reply_text("เกิดข้อผิดพลาดในการโหลดคู่มือ", reply_markup=reply_markup)
 
@@ -1273,7 +1248,6 @@ async def get_grid_settings(update: Update, context: ContextTypes.DEFAULT_TYPE) 
         await user_message.reply_text("❌ รูปแบบข้อมูลไม่ถูกต้อง กรุณาลองอีกครั้ง")
         return GRID_SETTINGS
 
-    # Transition to the new PROFIT_PERCENT step
     keyboard = [
         [KeyboardButton("1.0%"), KeyboardButton("1.5%"), KeyboardButton("2.0%")],
         [KeyboardButton("2.5%"), KeyboardButton("3.0%")],
@@ -1405,9 +1379,7 @@ async def handle_confirmation(update: Update, context: ContextTypes.DEFAULT_TYPE
 
     context.user_data.clear()
     
-    # --- MODIFICATION: Added Emojis to match handlers ---
     kb = [[KeyboardButton("🤖 จัดการบอท")], [KeyboardButton("⬅️ กลับไปเมนูหลัก")]]
-    # --- END MODIFICATION ---
     
     await update.message.reply_html(
         "กด จัดการบอท เพื่อดู/สั่งงานบอทของคุณ",
@@ -1595,10 +1567,8 @@ async def on_error(update: object, context: ContextTypes.DEFAULT_TYPE) -> None:
         logger.warning(f"Telegram API call timed out: {err}")
         return
         
-    # --- MODIFICATION: Handle the specific HTML parsing error ---
     if isinstance(err, BadRequest) and "Can't parse entities" in str(err):
         logger.error(f"HTML PARSING ERROR: {err}. This usually means mismatched tags in a sent message.")
-        # Optionally send a safe message to the user
         if update and hasattr(update, 'effective_chat_id'):
             try:
                 await context.bot.send_message(
@@ -1608,7 +1578,6 @@ async def on_error(update: object, context: ContextTypes.DEFAULT_TYPE) -> None:
             except Exception as e:
                 logger.error(f"Failed to send error fallback message: {e}")
         return
-    # --- END MODIFICATION ---
         
     logger.error("Unhandled error", exc_info=True)
 
@@ -1634,9 +1603,7 @@ def main() -> None:
     )
 
     manage_conv = ConversationHandler(
-        # --- MODIFICATION: Fixed typo 'บอт' to 'บอท' ---
         entry_points=[MessageHandler(filters.Regex('^🤖 จัดการบอท$'), manage_bots_start)],
-        # --- END MODIFICATION ---
         states={
             MANAGE_SELECT_BOT: [
                 MessageHandler(filters.Regex('^🤖 จัดการบอท$'), manage_bots_start),
@@ -1672,7 +1639,7 @@ def main() -> None:
     job_queue = application.job_queue
     job_queue.run_repeating(run_all_bots_periodically, interval=60, first=10)
     job_queue.run_repeating(send_hourly_report, interval=3600, first=3600)
-    job_queue.run_repeating(run_sentiment_analysis_periodically, interval=900, first=60) # Run sentiment job every 15 mins
+    job_queue.run_repeating(run_sentiment_analysis_periodically, interval=900, first=60)
 
     # Signal Handling for Graceful Shutdown
     def signal_handler(sig, frame):
