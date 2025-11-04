@@ -11,12 +11,18 @@ Upgraded Features:
 - Layer 2 AI (Strategic): Gemini Flash API + Google Search runs every 15 minutes
   to get a real-time sentiment_score (-1.0 to 1.0).
 - Veto System: A negative sentiment score can block "buy" signals from the TA layer.
-- Full Compounding: All profits are automatically reinvested during mode transitions.
 - FIXED (Bug 1): Unrealized P/L calculation to use bot's internal state.
 - FIXED (Bug 2): Test Mode P/L logic to correctly track coin amount.
 - FIXED (Bug 3): Robust selling logic in _enter_safe_mode.
 - FIXED (Bug 4): Deletion logic (confirm_delete) to liquidate assets based on
                  *actual exchange balance*, ignoring corrupted internal state.
+- NEW (Feature Request): Re-enabled Compounding Capital.
+                 Bot will now use 'original_capital' + 'all_time_realized_pnl'
+                 when starting a new mode (GRID or TRAILING_UP) from SAFE.
+- NEW (Feature Request): Hourly report now shows P/L (Realized) instead of P/L (Total).
+- NEW (Feature Request): Bot now runs full AI check (TA + Sentiment) *on start*
+                 to determine the correct initial mode, preventing rapid
+                 mode switching just after starting.
 """
 
 import os
@@ -285,7 +291,7 @@ class HybridGridBot:
         self.realized_pnl = 0.0 # PNL for *this cycle*
         self.total_investment = 0.0 
         self.total_coins_held = 0.0
-        self.all_time_realized_pnl = 0.0 # PNL *total* (Used for compounding)
+        self.all_time_realized_pnl = 0.0 # PNL *total* (Used for compounding/reporting)
 
         self.mode_change_candidate = None
         self.mode_change_counter = 0
@@ -344,7 +350,50 @@ class HybridGridBot:
     async def start(self):
         self.is_running = True
         logger.info(f"[{self.settings['symbol']}] Bot instance STARTED.")
-        await self.send_telegram_message("✅ Bot started successfully!\nInitiating first logic cycle...")
+        await self.send_telegram_message("✅ Bot started successfully!\n⏳ Initializing... Fetching market data and AI sentiment...")
+
+        symbol = self.settings['symbol']
+        
+        try:
+            # 1. Fetch Sentiment
+            await self.update_sentiment_analysis()
+            
+            # 2. Fetch Market Data for TA
+            df = await get_market_data(symbol, self.settings['timeframe'])
+            if df.empty:
+                await self.send_telegram_message(f"⚠️ Could not fetch market data for {symbol} on start. Bot stopping.")
+                self.is_running = False
+                return
+
+            # 3. Calculate TA
+            self.ai_score, self.adx = self._calculate_ai_score(df)
+            
+            # 4. Determine initial strategy
+            # We are currently in "SAFE" mode (default), so _determine_strategy will pick the correct entry mode
+            initial_mode = await self._determine_strategy() 
+            
+            await self.send_telegram_message(
+                f"✅ Initialization complete.\n"
+                f"AI (TA) score: <code>{self.ai_score:+.2f}</code>\n"
+                f"AI (Sentiment) avg: <code>{self.avg_sentiment_score:+.2f}</code>\n"
+                f"Entering <code>{initial_mode}</code> mode...",
+                use_html=True
+            )
+            
+            # 5. Handle the transition from SAFE to the chosen mode
+            # We pass 'df' so it doesn't need to be fetched again
+            if initial_mode != "SAFE":
+                await self._handle_mode_transition(initial_mode, df)
+            else:
+                self.current_mode = "SAFE"
+                await self.send_telegram_message("ℹ️ Market conditions require staying in 🛡️ SAFE mode.")
+
+        except Exception as e:
+            logger.error(f"[{symbol}] Error during initial start sequence: {e}", exc_info=True)
+            await self.send_telegram_message(f"‼️ Error during initialization: {e}. Bot stopping.")
+            self.is_running = False
+            
+        # The regular job_queue will now take over for subsequent cycles
     
     def stop(self): self.is_running = False; logger.info(f"[{self.settings['symbol']}] Bot instance STOPPED.")
 
@@ -584,7 +633,7 @@ class HybridGridBot:
         """
         await self.send_telegram_message("⏳ Entering SAFE mode. Selling assets...")
         
-        # --- NEW ROBUST LOGIC ---
+        # --- ROBUST LOGIC (FIX 3) ---
         
         # 1. Determine the amount to sell based on the bot's *internal* state.
         #    This is CRITICAL for P/L calculation.
@@ -649,31 +698,33 @@ class HybridGridBot:
             await self.send_telegram_message("ℹ️ No assets available to sell after sync. Resetting state.")
             self.total_investment, self.total_coins_held = 0.0, 0.0
         
-        # --- END NEW ROBUST LOGIC ---
+        # --- END ROBUST LOGIC ---
 
     async def _enter_trailing_up_mode(self, client: BitkubClient):
-        await self.send_telegram_message("⏳ Entering TRAILING_UP mode. Re-investing compounded capital...")
+        await self.send_telegram_message("⏳ Entering TRAILING_UP mode. Re-investing capital...")
 
-        # --- PNL REFACTOR: Use all_time_realized_pnl for compounding ---
-        total_equity = self.original_capital + self.all_time_realized_pnl
+        # --- MODIFICATION: Use Compounding Capital (User Request) ---
+        total_equity = self.original_capital + self.all_time_realized_pnl # Use original capital + all realized P/L
+        # total_equity = self.original_capital (Old Fixed Capital Logic)
+        # --- END MODIFICATION ---
         
         if total_equity < 100:
             await self.send_telegram_message(f"❌ Not enough capital to enter TRAILING_UP. Total equity is only {total_equity:,.2f} THB.")
             self.stop()
             return
 
+        # We keep this message, but it's now informational.
         if self.realized_pnl != 0:
-             await self.send_telegram_message(f"ℹ️ Compounding P/L. Total equity for this cycle is now {total_equity:,.2f} THB.")
+             await self.send_telegram_message(f"ℹ️ P/L from last cycle: {self.realized_pnl:+.2f} THB. Using Compounding Capital {total_equity:,.2f} THB for this cycle.")
         
         self.realized_pnl = 0.0 # Reset cycle PNL
         capital_to_use = total_equity * 0.995
-        # --- END PNL REFACTOR ---
 
         balances = await client.get_balances()
         if balances.get('error') == 0:
             thb_balance = float(balances.get('result', {}).get('THB', {}).get('available', 0))
             if thb_balance < capital_to_use:
-                logger.warning(f"[{self.settings['symbol']}] Insufficient balance ({thb_balance:,.2f}) for compounded capital ({capital_to_use:,.2f}). Using available balance.")
+                logger.warning(f"[{self.settings['symbol']}] Insufficient balance ({thb_balance:,.2f}) for compounding capital ({capital_to_use:,.2f}). Using available balance.")
                 capital_to_use = thb_balance * 0.995
 
             if capital_to_use > 10 and self.settings.get('trade_mode') == 'Live':
@@ -712,8 +763,10 @@ class HybridGridBot:
         if not latest_price:
             await self.send_telegram_message("❌ Grid setup failed: could not get latest price."); return await self._enter_safe_mode(client)
         
-        # --- PNL REFACTOR: Use all_time_realized_pnl for compounding ---
-        total_equity = self.original_capital + self.all_time_realized_pnl
+        # --- MODIFICATION: Use Compounding Capital (User Request) ---
+        total_equity = self.original_capital + self.all_time_realized_pnl # Use original capital + all realized P/L
+        # total_equity = self.original_capital (Old Fixed Capital Logic)
+        # --- END MODIFICATION ---
 
         if total_equity < 100:
             await self.send_telegram_message(f"❌ Not enough capital to enter GRID. Total equity is only {total_equity:,.2f} THB.")
@@ -721,11 +774,10 @@ class HybridGridBot:
             return
         
         if self.realized_pnl != 0:
-             await self.send_telegram_message(f"ℹ️ Compounding P/L. Total equity for this cycle is now {total_equity:,.2f} THB.")
+             await self.send_telegram_message(f"ℹ️ P/L from last cycle: {self.realized_pnl:+.2f} THB. Using Compounding Capital {total_equity:,.2f} THB for this cycle.")
 
         self.realized_pnl = 0.0 # Reset cycle PNL
         self.grid_capital_per_level = total_equity / len(self.grid_levels) if self.grid_levels else 0
-        # --- END PNL REFACTOR ---
         
         if self.grid_capital_per_level < 10:
              await self.send_telegram_message(f"❌ Capital per grid ({self.grid_capital_per_level:.2f} THB) is below the 10 THB minimum. Please restart with more capital or a different grid strategy.")
@@ -844,7 +896,8 @@ class HybridGridBot:
 
         await self._cancel_all_orders(client)
 
-        # --- PNL REFACTOR: Use all_time_realized_pnl for compounding ---
+        # --- Grid Shift *still* compounds (This is by design) ---
+        # A grid shift is part of the *same* cycle, so we re-invest P/L
         total_equity = self.original_capital + self.all_time_realized_pnl
         
         if total_equity < 100:
@@ -854,6 +907,7 @@ class HybridGridBot:
             return
 
         if self.realized_pnl != 0:
+            # This "realized_pnl" is from the *current* cycle (which we are still in)
             await self.send_telegram_message(f"📈 Compounding! Total equity for new grid is now {total_equity:,.2f} THB.")
         
         self.realized_pnl = 0.0 # Reset cycle PNL
@@ -1005,12 +1059,13 @@ class HybridGridBot:
         average_cost = self.total_investment / self.total_coins_held if self.total_coins_held > 0 else 0
         
         # --- FIX (Bug 1): Use self.total_coins_held (Bot's record) for Unrealized P/L ---
-        # This prevents including pre-existing coins from the exchange balance
         unrealized_pnl = (latest_price - average_cost) * self.total_coins_held if average_cost > 0 else 0
         
         # --- PNL REFACTOR: Use all_time_realized_pnl ---
+        # This (current_equity) is the "true value" of the bot right now
         current_equity = self.original_capital + self.all_time_realized_pnl + unrealized_pnl
         
+        # Total P/L is how much the "true value" has changed from the start
         total_pnl = current_equity - self.original_capital
         # --- END PNL REFACTOR ---
         
@@ -1075,15 +1130,24 @@ class HybridGridBot:
             f"AI Mode: {mode_icon} <code>{self.current_mode}</code>",
             f"AI (TA): {ai_icon} {html.escape(ai_text)} (<code>{self.ai_score:+.2f}</code>, ADX: <code>{self.adx:.1f}</code>)",
             f"AI (Sentiment): {senti_icon} {html.escape(senti_text)} (Latest: <code>{self.sentiment_score:+.1f}</code>)",
-            f"AI (Sentiment Avg): {avg_senti_icon} {html.escape(avg_senti_text)} (Avg: C<code>{self.avg_sentiment_score:+.2f}</code> <b>[Logic]</b>)",
+            f"AI (Sentiment Avg): {avg_senti_icon} {html.escape(avg_senti_text)} (Avg: <code>{self.avg_sentiment_score:+.2f}</code> <b>[Logic]</b>)",
             f"Grid Orders: 🟢 BUY <code>{len(live_open_buys)}</code> | 🔴 SELL <code>{len(live_open_sells)}</code>",
             # --- PNL REFACTOR: Report Original Capital ---
             f"Original Capital: 💰 <code>{self.original_capital:,.2f} THB</code>",
             # --- END PNL REFACTOR ---
         ]
         
-        total_pnl_color = "🟢" if pnl['total_pnl'] >= 0 else "🔴"
-        report_lines.append(f"P/L (Total): {total_pnl_color} <code>{pnl['total_pnl']:+,.2f} THB ({pnl['pnl_percent']:+.2f}%)</code>")
+        # --- MODIFICATION: Show Realized P/L for Hourly, Total P/L for Data ---
+        if report_type == 'hourly':
+            # Hourly report shows Realized P/L as requested
+            realized_pnl_color = "🟢" if pnl['all_time_realized_pnl'] >= 0 else "🔴"
+            realized_pnl_percent = (pnl['all_time_realized_pnl'] / self.original_capital) * 100 if self.original_capital > 0 else 0
+            report_lines.append(f"P/L (Realized): {realized_pnl_color} <code>{pnl['all_time_realized_pnl']:+,.2f} THB ({realized_pnl_percent:+.2f}%)</code>")
+        else:
+            # Data report (management card) shows Total P/L
+            total_pnl_color = "🟢" if pnl['total_pnl'] >= 0 else "🔴"
+            report_lines.append(f"P/L (Total): {total_pnl_color} <code>{pnl['total_pnl']:+,.2f} THB ({pnl['pnl_percent']:+.2f}%)</code>")
+        # --- END MODIFICATION ---
 
         report_lines.append(f"Sentiment Justification: <i>{html.escape(self.sentiment_justification)}</i>")
 
@@ -1431,7 +1495,7 @@ async def handle_confirmation(update: Update, context: ContextTypes.DEFAULT_TYPE
                 bot.set_context(context.application)
                 user_bots[bot_id] = bot
                 await update.message.reply_html(f"✔️ สร้างบอทสำหรับ <b>{html.escape(settings['symbol'])}</b> สำเร็จแล้ว!")
-                await bot.start()
+                await bot.start() # This will now run the new, smarter start logic
                 save_bots_state()
         except Exception as e:
             logger.error(f"Error during bot startup: {e}", exc_info=True)
@@ -1515,7 +1579,7 @@ async def select_bot_action(update: Update, context: ContextTypes.DEFAULT_TYPE) 
         return await manage_bots_start(update, context)
 
     if "Start" in action_text:
-        await bot.start()
+        await bot.start() # This will now run the new, smarter start logic
         await update.message.reply_html(f"🟢 บอท <b>{html.escape(bot.settings['symbol'])}</b> เริ่มทำงานแล้ว")
         save_bots_state()
         return await manage_bots_start(update, context)
@@ -1722,9 +1786,10 @@ def main() -> None:
 
     # Job Queue Setup
     job_queue = application.job_queue
-    job_queue.run_repeating(run_all_bots_periodically, interval=60, first=10)
-    job_queue.run_repeating(send_hourly_report, interval=3600, first=3600)
-    job_queue.run_repeating(run_sentiment_analysis_periodically, interval=900, first=60)
+    # We run the logic cycle *after* the sentiment job to ensure sentiment is fresh
+    job_queue.run_repeating(run_sentiment_analysis_periodically, interval=900, first=60) # 15 mins
+    job_queue.run_repeating(run_all_bots_periodically, interval=60, first=70) # 1 min, starts after first sentiment
+    job_queue.run_repeating(send_hourly_report, interval=3600, first=3600) # 1 hour
 
     # Signal Handling for Graceful Shutdown
     def signal_handler(sig, frame):
