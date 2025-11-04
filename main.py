@@ -12,9 +12,11 @@ Upgraded Features:
   to get a real-time sentiment_score (-1.0 to 1.0).
 - Veto System: A negative sentiment score can block "buy" signals from the TA layer.
 - Full Compounding: All profits are automatically reinvested during mode transitions.
-- FIXED: Removed redundant `parse_mode` from `reply_html` call.
-- FIXED: Corrected `resize_keyboards` to `resize_keyboard` in start/help.
-- FIXED: Updated Gemini API endpoint and authentication
+- FIXED (Bug 1): Unrealized P/L calculation to use bot's internal state.
+- FIXED (Bug 2): Test Mode P/L logic to correctly track coin amount.
+- FIXED (Bug 3): Robust selling logic in _enter_safe_mode.
+- FIXED (Bug 4): Deletion logic (confirm_delete) to liquidate assets based on
+                 *actual exchange balance*, ignoring corrupted internal state.
 """
 
 import os
@@ -52,7 +54,6 @@ from telegram.error import BadRequest, TimedOut
 
 # --- Configuration Loading ---
 try:
-    # --- MODIFIED: Added GEMINI_API_KEY import ---
     from config import TELEGRAM_TOKEN, BITKUB_API_KEY, BITKUB_API_SECRET, GEMINI_API_KEY
 except ImportError:
     print("Error: config.py not found or variables are missing.")
@@ -278,10 +279,8 @@ class HybridGridBot:
         self.open_sell_orders = {}
         self.last_checked_price = 0
         
-        # --- PNL REFACTOR ---
         self.initial_capital = self.settings.get('capital', 0) 
         self.original_capital = self.settings.get('capital', 0)
-        # --- END PNL REFACTOR ---
         
         self.realized_pnl = 0.0 # PNL for *this cycle*
         self.total_investment = 0.0 
@@ -571,7 +570,7 @@ class HybridGridBot:
         
         if self.current_mode != "SAFE":
             await self._enter_safe_mode(client)
-            await asyncio.sleep(3) 
+            await asyncio.sleep(3) # Wait for sale to settle
 
         if new_mode == "TRAILING_UP": await self._enter_trailing_up_mode(client)
         elif new_mode == "GRID": await self._enter_grid_mode(client, df)
@@ -579,36 +578,83 @@ class HybridGridBot:
         self.current_mode = new_mode
 
     async def _enter_safe_mode(self, client: BitkubClient):
+        """
+        Robustly sells assets held by the bot and resets the state.
+        This prevents orphaned coins and ensures correct P/L calculation.
+        """
         await self.send_telegram_message("⏳ Entering SAFE mode. Selling assets...")
-        balances = await client.get_balances()
-        if balances.get('error') == 0:
+        
+        # --- NEW ROBUST LOGIC ---
+        
+        # 1. Determine the amount to sell based on the bot's *internal* state.
+        #    This is CRITICAL for P/L calculation.
+        amount_to_sell = self.total_coins_held
+        
+        if amount_to_sell <= 0.0001:
+            # If the bot thinks it has no coins, just reset the state.
+            await self.send_telegram_message("ℹ️ No assets held by the bot. Resetting state.")
+            self.total_investment, self.total_coins_held = 0.0, 0.0
+            return
+
+        # 2. If we are in Live Mode, check if we *actually* have the coins.
+        if self.settings.get('trade_mode') == 'Live':
+            balances = await client.get_balances()
+            if balances.get('error') != 0:
+                await self.send_telegram_message("❌ Could not get balances to sell assets. State not reset.")
+                return # Abort!
+            
             symbol_balance = float(balances.get('result', {}).get(self.settings['symbol'], {}).get('available', 0))
-            if symbol_balance > 0.0001:
-                if self.settings.get('trade_mode') == 'Live':
-                    api_symbol = f"{self.settings['symbol']}_THB"
-                    res = await client.place_ask(api_symbol, amt=symbol_balance, rat=0, typ='market')
-                    if res.get('error') == 0:
-                        fill = res['result']
-                        proceeds = float(fill['amt'])
-                        profit = proceeds - self.total_investment
-                        self.realized_pnl += profit
-                        self.all_time_realized_pnl += profit
-                        await self.send_telegram_message(f"✅ ปิด Cycle. P/L ของรอบนี้: {profit:+.2f} THB (จะถูกนำไปทบต้น)")
-                    else:
-                        await self.send_telegram_message(f"❌ Error selling: {res}")
+            
+            if symbol_balance < amount_to_sell:
+                logger.warning(f"[{self.settings['symbol']}] State desync! Bot thought it had {amount_to_sell:.8f}, but only {symbol_balance:.8f} is available. Selling available amount.")
+                await self.send_telegram_message(f"⚠️ [{self.settings['symbol']}] State desync! Bot thought it had {amount_to_sell:.8f}, but only {symbol_balance:.8f} is available. Selling available amount.")
+                amount_to_sell = symbol_balance # Sell what we can
+
+        # 3. Proceed with the sale (Live or Test)
+        if amount_to_sell > 0.0001:
+            proceeds = 0.0
+            profit = 0.0
+            
+            if self.settings.get('trade_mode') == 'Live':
+                api_symbol = f"{self.settings['symbol']}_THB"
+                res = await client.place_ask(api_symbol, amt=amount_to_sell, rat=0, typ='market')
+                if res.get('error') == 0:
+                    fill = res['result']
+                    proceeds = float(fill['amt'])
+                    
+                    # Calculate P/L based *only* on the amount we *actually* sold
+                    cost_of_sold_coins = (self.total_investment / self.total_coins_held) * amount_to_sell if self.total_coins_held > 0 else 0
+                    profit = proceeds - cost_of_sold_coins
+                    
+                    await self.send_telegram_message(f"✅ ปิด Cycle (ขาย {amount_to_sell:.8f} {self.settings['symbol']}). P/L ของรอบนี้: {profit:+.2f} THB (จะถูกนำไปทบต้น)")
                 else:
-                    latest_price = await get_latest_price(self.settings['symbol']) or self.last_checked_price
-                    proceeds = self.total_coins_held * latest_price
-                    profit = proceeds - self.total_investment
-                    self.realized_pnl += profit
-                    self.all_time_realized_pnl += profit
-                    await self.send_telegram_message(f"🧪 TEST MODE: ปิด Cycle. P/L ของรอบนี้: {profit:+.2f} THB (จะถูกนำไปทบต้น)")
-        self.total_investment, self.total_coins_held = 0.0, 0.0
+                    await self.send_telegram_message(f"❌ Error selling: {res}. State not reset.")
+                    return # Abort! Sale failed, do not reset state.
+            
+            else: # Test Mode (This logic is now correct from the last file)
+                latest_price = await get_latest_price(self.settings['symbol']) or self.last_checked_price
+                proceeds = self.total_coins_held * latest_price
+                profit = proceeds - self.total_investment
+                await self.send_telegram_message(f"🧪 TEST MODE: ปิด Cycle. P/L ของรอบนี้: {profit:+.2f} THB (จะถูกนำไปทบต้น)")
+
+            # 4. Success! Update P/L and reset state.
+            self.realized_pnl += profit # This is the cycle PNL
+            self.all_time_realized_pnl += profit # This is the cumulative PNL
+            
+            # Reset state *only* after a successful sale
+            self.total_investment, self.total_coins_held = 0.0, 0.0
+        
+        else:
+            # This case might be hit if the desync logic above sets amount_to_sell to 0
+            await self.send_telegram_message("ℹ️ No assets available to sell after sync. Resetting state.")
+            self.total_investment, self.total_coins_held = 0.0, 0.0
+        
+        # --- END NEW ROBUST LOGIC ---
 
     async def _enter_trailing_up_mode(self, client: BitkubClient):
         await self.send_telegram_message("⏳ Entering TRAILING_UP mode. Re-investing compounded capital...")
 
-        # --- PNL REFACTOR ---
+        # --- PNL REFACTOR: Use all_time_realized_pnl for compounding ---
         total_equity = self.original_capital + self.all_time_realized_pnl
         
         if total_equity < 100:
@@ -619,7 +665,7 @@ class HybridGridBot:
         if self.realized_pnl != 0:
              await self.send_telegram_message(f"ℹ️ Compounding P/L. Total equity for this cycle is now {total_equity:,.2f} THB.")
         
-        self.realized_pnl = 0.0
+        self.realized_pnl = 0.0 # Reset cycle PNL
         capital_to_use = total_equity * 0.995
         # --- END PNL REFACTOR ---
 
@@ -666,7 +712,7 @@ class HybridGridBot:
         if not latest_price:
             await self.send_telegram_message("❌ Grid setup failed: could not get latest price."); return await self._enter_safe_mode(client)
         
-        # --- PNL REFACTOR ---
+        # --- PNL REFACTOR: Use all_time_realized_pnl for compounding ---
         total_equity = self.original_capital + self.all_time_realized_pnl
 
         if total_equity < 100:
@@ -677,7 +723,7 @@ class HybridGridBot:
         if self.realized_pnl != 0:
              await self.send_telegram_message(f"ℹ️ Compounding P/L. Total equity for this cycle is now {total_equity:,.2f} THB.")
 
-        self.realized_pnl = 0.0
+        self.realized_pnl = 0.0 # Reset cycle PNL
         self.grid_capital_per_level = total_equity / len(self.grid_levels) if self.grid_levels else 0
         # --- END PNL REFACTOR ---
         
@@ -720,32 +766,38 @@ class HybridGridBot:
         else: # Test Mode
             capital_to_buy = capital_for_initial_sells
             if capital_to_buy > 10:
+                # --- FIX: Test mode initial buy (Bug 2 fix) ---
                 self.total_investment += capital_to_buy
-                self.total_coins_held += capital_to_buy / latest_price
+                self.total_coins_held += capital_to_buy / latest_price # Correctly add coins
                 await self.send_telegram_message(f"🧪 TEST MODE: Simulating initial buy with {capital_to_buy:,.2f} THB.")
-            coin_available = self.total_coins_held
+            coin_available = self.total_coins_held # Use internal record
         
+        # --- FIX: Use correct coin_available for both modes ---
         coin_per_sell_grid = coin_available / len(sell_levels_prices) if sell_levels_prices else 0
         
         for buy_price_level in sell_levels_prices:
             profit_pct = self.settings.get('profit_percent', 0)
             sell_price = self._format_price(buy_price_level * (1 + profit_pct / 100))
-            if coin_per_sell_grid * sell_price > 10 and self.settings.get('trade_mode') == 'Live':
-                res = await client.place_ask(api_symbol, amt=coin_per_sell_grid, rat=sell_price, typ='limit')
-                if res.get('error') == 0:
-                    actual_rate = float(res['result']['rat'])
-                    self.open_sell_orders[actual_rate] = res['result']['id']
-            else:
+            
+            if self.settings.get('trade_mode') == 'Live':
+                if coin_per_sell_grid * sell_price > 10:
+                    res = await client.place_ask(api_symbol, amt=coin_per_sell_grid, rat=sell_price, typ='limit')
+                    if res.get('error') == 0:
+                        actual_rate = float(res['result']['rat'])
+                        self.open_sell_orders[actual_rate] = res['result']['id']
+            else: # Test Mode
+                 # We assume we have the coins to sell
                  self.open_sell_orders[sell_price] = f"test_sell_{int(time.time())}"
 
         for price in buy_levels:
-            if self.grid_capital_per_level > 10 and self.settings.get('trade_mode') == 'Live':
-                res = await client.place_bid(api_symbol, amt=self.grid_capital_per_level, rat=price, typ='limit')
-                if res.get('error') == 0:
-                    actual_rate = float(res['result']['rat'])
-                    self.open_buy_orders[actual_rate] = res['result']['id']
-            else:
-                 self.open_buy_orders[price] = f"test_buy_{int(time.time())}"
+            if self.grid_capital_per_level > 10: # Check applies to both modes
+                if self.settings.get('trade_mode') == 'Live':
+                    res = await client.place_bid(api_symbol, amt=self.grid_capital_per_level, rat=price, typ='limit')
+                    if res.get('error') == 0:
+                        actual_rate = float(res['result']['rat'])
+                        self.open_buy_orders[actual_rate] = res['result']['id']
+                else: # Test Mode
+                     self.open_buy_orders[price] = f"test_buy_{int(time.time())}"
                  
         await self.send_telegram_message("✅ Grid Initialized with Limit Buy/Sell orders.")
 
@@ -792,7 +844,7 @@ class HybridGridBot:
 
         await self._cancel_all_orders(client)
 
-        # --- PNL REFACTOR ---
+        # --- PNL REFACTOR: Use all_time_realized_pnl for compounding ---
         total_equity = self.original_capital + self.all_time_realized_pnl
         
         if total_equity < 100:
@@ -804,7 +856,7 @@ class HybridGridBot:
         if self.realized_pnl != 0:
             await self.send_telegram_message(f"📈 Compounding! Total equity for new grid is now {total_equity:,.2f} THB.")
         
-        self.realized_pnl = 0.0
+        self.realized_pnl = 0.0 # Reset cycle PNL
         # --- END PNL REFACTOR ---
 
         await self._calculate_grid_levels(df)
@@ -824,13 +876,14 @@ class HybridGridBot:
         await self.send_telegram_message(f"✅ Placing {len(self.grid_levels)} new Limit Buy orders in the shifted grid (Wait for Pullback strategy).")
 
         for price in self.grid_levels:
-            if self.grid_capital_per_level > 10 and self.settings.get('trade_mode') == 'Live':
-                res = await client.place_bid(api_symbol, amt=self.grid_capital_per_level, rat=price, typ='limit')
-                if res.get('error') == 0:
-                    actual_rate = float(res['result']['rat'])
-                    self.open_buy_orders[actual_rate] = res['result']['id']
-            else:
-                 self.open_buy_orders[price] = f"test_buy_{int(time.time())}"
+            if self.grid_capital_per_level > 10:
+                if self.settings.get('trade_mode') == 'Live':
+                    res = await client.place_bid(api_symbol, amt=self.grid_capital_per_level, rat=price, typ='limit')
+                    if res.get('error') == 0:
+                        actual_rate = float(res['result']['rat'])
+                        self.open_buy_orders[actual_rate] = res['result']['id']
+                else: # Test Mode
+                     self.open_buy_orders[price] = f"test_buy_{int(time.time())}"
         
         self.open_sell_orders = {}
         self.total_investment = 0.0
@@ -891,7 +944,7 @@ class HybridGridBot:
             
             coin_amount = self.grid_capital_per_level / original_buy_price
             profit = (sell_price - original_buy_price) * coin_amount
-            self.all_time_realized_pnl += profit
+            self.all_time_realized_pnl += profit # Use all_time PNL
             self.total_investment -= self.grid_capital_per_level 
             self.total_coins_held -= coin_amount
             await self.send_telegram_message(f"   -> Realized Profit: <code>{profit:+.2f} THB</code>", use_html=True)
@@ -917,9 +970,11 @@ class HybridGridBot:
             await self.send_telegram_message(f"📈 [{symbol}] 🟢 BUY Filled! Price: <code>{format_display_price(buy_price)}</code>", use_html=True)
             del self.open_buy_orders[buy_price]
             
+            # --- FIX: Test mode P/L tracking (Bug 2 fix) ---
             self.total_investment += self.grid_capital_per_level
             coin_amount_bought = self.grid_capital_per_level / buy_price
             self.total_coins_held += coin_amount_bought
+            # --- END FIX ---
             
             if self.settings.get('trade_mode') == 'Live':
                 res = await client.place_ask(api_symbol, amt=coin_amount_bought, rat=sell_price, typ='limit')
@@ -949,20 +1004,23 @@ class HybridGridBot:
     def _calculate_pnl_components(self, latest_price, coin_balance):
         average_cost = self.total_investment / self.total_coins_held if self.total_coins_held > 0 else 0
         
-        # --- MODIFICATION: Use bot's internal 'total_coins_held' not exchange 'coin_balance' ---
+        # --- FIX (Bug 1): Use self.total_coins_held (Bot's record) for Unrealized P/L ---
+        # This prevents including pre-existing coins from the exchange balance
         unrealized_pnl = (latest_price - average_cost) * self.total_coins_held if average_cost > 0 else 0
-        # --- END MODIFICATION ---
         
+        # --- PNL REFACTOR: Use all_time_realized_pnl ---
         current_equity = self.original_capital + self.all_time_realized_pnl + unrealized_pnl
         
         total_pnl = current_equity - self.original_capital
+        # --- END PNL REFACTOR ---
+        
         pnl_percent = (total_pnl / self.original_capital) * 100 if self.original_capital > 0 else 0
         
         return {
             "unrealized_pnl": unrealized_pnl, 
             "total_pnl": total_pnl, 
             "pnl_percent": pnl_percent,
-            "all_time_realized_pnl": self.all_time_realized_pnl
+            "all_time_realized_pnl": self.all_time_realized_pnl # Pass this through
         }
 
     async def _generate_report_text(self, report_type: str) -> str:
@@ -992,6 +1050,7 @@ class HybridGridBot:
 
         if self.settings.get('trade_mode') == 'Live':
             balances = await client.get_balances()
+            # We get coin_balance from exchange, but P/L calculation uses bot's internal state
             coin_balance = float(balances.get('result',{}).get(symbol,{}).get('available',0)) if balances.get('error') == 0 else self.total_coins_held
             
             open_orders_res = await client.my_open_orders(api_symbol)
@@ -1006,10 +1065,9 @@ class HybridGridBot:
             live_open_buys = list(self.open_buy_orders.keys())
             live_open_sells = list(self.open_sell_orders.keys())
 
-        # --- MODIFICATION: Pass 'coin_balance' (from exchange) for display ---
-        # --- The actual calculation bug is fixed inside _calculate_pnl_components ---
+        # --- FIX (Bug 1): P/L calculation is now correct because _calculate_pnl_components uses
+        # self.total_coins_held (internal) instead of coin_balance (exchange)
         pnl = self._calculate_pnl_components(latest_price, coin_balance)
-        # --- END MODIFICATION ---
 
         report_lines = [
             f"Status: {status_text}",
@@ -1017,9 +1075,11 @@ class HybridGridBot:
             f"AI Mode: {mode_icon} <code>{self.current_mode}</code>",
             f"AI (TA): {ai_icon} {html.escape(ai_text)} (<code>{self.ai_score:+.2f}</code>, ADX: <code>{self.adx:.1f}</code>)",
             f"AI (Sentiment): {senti_icon} {html.escape(senti_text)} (Latest: <code>{self.sentiment_score:+.1f}</code>)",
-            f"AI (Sentiment Avg): {avg_senti_icon} {html.escape(avg_senti_text)} (Avg: <code>{self.avg_sentiment_score:+.2f}</code> <b>[Logic]</b>)",
+            f"AI (Sentiment Avg): {avg_senti_icon} {html.escape(avg_senti_text)} (Avg: C<code>{self.avg_sentiment_score:+.2f}</code> <b>[Logic]</b>)",
             f"Grid Orders: 🟢 BUY <code>{len(live_open_buys)}</code> | 🔴 SELL <code>{len(live_open_sells)}</code>",
+            # --- PNL REFACTOR: Report Original Capital ---
             f"Original Capital: 💰 <code>{self.original_capital:,.2f} THB</code>",
+            # --- END PNL REFACTOR ---
         ]
         
         total_pnl_color = "🟢" if pnl['total_pnl'] >= 0 else "🔴"
@@ -1028,10 +1088,12 @@ class HybridGridBot:
         report_lines.append(f"Sentiment Justification: <i>{html.escape(self.sentiment_justification)}</i>")
 
         if report_type == 'data':
+            # --- PNL REFACTOR: Report All Time Realized PNL ---
             realized_pnl_color = "🟢" if pnl['all_time_realized_pnl'] >= 0 else "🔴"
             unrealized_pnl_color = "🟢" if pnl['unrealized_pnl'] >= 0 else "🔴"
             report_lines.append(f"  - P/L (Realized): {realized_pnl_color} <code>{pnl['all_time_realized_pnl']:+,.2f} THB</code>")
             report_lines.append(f"  - Unrealized: {unrealized_pnl_color} <code>{pnl['unrealized_pnl']:+,.2f} THB</code>")
+            # --- END PNL REFACTOR ---
             
             report_lines.append(f"\nGrid Orders ({'Live' if self.settings.get('trade_mode') == 'Live' else 'Test Mode'}):")
             
@@ -1498,11 +1560,34 @@ async def confirm_delete(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
         return MANAGE_SELECT_ACTION
     else:
         symbol = bot_to_delete.settings['symbol']
+        api_symbol = f"{symbol}_THB"
         bot_to_delete.stop()
         client = bot_to_delete.get_client()
+
         if 'ขายเหรียญ' in choice:
-            await bot_to_delete._enter_safe_mode(client)
-        await bot_to_delete._cancel_all_orders(client)
+            # --- NEW ROBUST DELETE-SELL LOGIC (BUG 4 FIX) ---
+            # We can't trust _enter_safe_mode if the state is corrupted (e.g., total_coins_held=0)
+            # We must liquidate based on *actual* exchange balance.
+            if bot_to_delete.settings.get('trade_mode') == 'Live':
+                await update.message.reply_text(f"Attempting to liquidate all {symbol} assets on Bitkub...")
+                balances = await client.get_balances()
+                if balances.get('error') == 0:
+                    symbol_balance = float(balances.get('result', {}).get(symbol, {}).get('available', 0))
+                    if symbol_balance > 0.0001:
+                        res = await client.place_ask(api_symbol, amt=symbol_balance, rat=0, typ='market')
+                        if res.get('error') == 0:
+                            await update.message.reply_text(f"✅ Successfully sold {symbol_balance:.8f} {symbol}.")
+                        else:
+                            await update.message.reply_text(f"❌ Error liquidating {symbol}: {res.get('message', 'Unknown Error')}")
+                    else:
+                        await update.message.reply_text(f"ℹ️ No {symbol} assets found on Bitkub to sell.")
+                else:
+                    await update.message.reply_text(f"❌ Could not check balance to liquidate: {balances.get('message', 'Unknown Error')}")
+            else:
+                await update.message.reply_text(f"ℹ️ Bot is in Test Mode. No real assets to sell.")
+            # --- END NEW LOGIC ---
+        
+        await bot_to_delete._cancel_all_orders(client) # This is still needed
 
         del user_bots[bot_id]
         save_bots_state()
@@ -1655,3 +1740,4 @@ def main() -> None:
 
 if __name__ == "__main__":
     main()
+
